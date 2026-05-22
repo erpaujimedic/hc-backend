@@ -1,0 +1,18 @@
+# Mengabaikan folder environment lokal
+venv/
+env/
+
+# Mengabaikan cache Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Mengabaikan file testing & rahasia
+.pytest_cache/
+.env
+serviceAccountKey.json
+
+# Mengabaikan file OS
+.DS_Store
+Thumbs.db
