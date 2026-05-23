@@ -5,6 +5,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import sentry_sdk
+import json
 
 # Firebase Authentication Engine
 import firebase_admin
@@ -26,8 +27,19 @@ from app.api.v1.endpoints import configs # 👈 Import lu udah bener di sini
 # Mencegah Firebase di-initialize 2 kali (yang bikin error)
 if not firebase_admin._apps:
     try:
-        # File JSON ditaruh di root folder (sejajar dengan folder app)
-        cred = credentials.Certificate("serviceAccountKey.json")
+        # Cek apakah ada kredensial JSON dari Environment Variable (Render)
+        firebase_json = os.getenv("FIREBASE_CREDENTIALS_JSON")
+        
+        if firebase_json:
+            # 🔥 Jika di Render, baca string JSON langsung dari environment
+            cred_dict = json.loads(firebase_json)
+            cred = credentials.Certificate(cred_dict)
+            print("☁️ [Firebase Engine] Initializing with Environment Variable...")
+        else:
+            # 💻 Jika di Localhost, baca dari file lokal biasa
+            cred = credentials.Certificate("serviceAccountKey.json")
+            print("💻 [Firebase Engine] Initializing with local JSON file...")
+            
         firebase_admin.initialize_app(cred)
         print("✅ [Firebase Engine] Successfully Initialized!")
     except Exception as e:
