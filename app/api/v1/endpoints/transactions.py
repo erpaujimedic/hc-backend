@@ -1,6 +1,8 @@
 # File: app/api/v1/endpoints/transactions.py
-from fastapi import APIRouter, HTTPException, status, Query, Body
-from typing import List, Optional, Any
+from fastapi import APIRouter, HTTPException, status
+from pydantic import BaseModel, Field
+from typing import List, Optional, Dict, Any
+from datetime import datetime, timezone
 
 # IMPORTANT: Import your Supabase client
 from app.db.supabase import supabase
@@ -8,22 +10,81 @@ from app.db.supabase import supabase
 router = APIRouter()
 
 # ==========================================
-# 1. RETRIEVE ALL TRANSACTIONS (WITH TELEMETRY)
+# 🛡️ PYDANTIC SCHEMAS (SILICON VALLEY STANDARD)
+# Strict validation models to protect the database
+# ==========================================
+
+class TransactionCreate(BaseModel):
+    order_source: str = Field(default="INTERNAL", description="B2B Source or Platform")
+    patient_name: str
+    phone: str
+    address: str
+    maps_link: Optional[str] = None
+    service: str
+    
+    # 🔥 THE BULLETPROOF FIX: Izinkan menerima null (None) dari Frontend!
+    schedule_date: Optional[str] = None
+    schedule_time: Optional[str] = None
+    branch: Optional[str] = None
+    
+    nurse_name: Optional[str] = None
+    patient_lat: Optional[float] = None
+    patient_lng: Optional[float] = None
+
+class TransactionUpdate(BaseModel):
+    order_source: Optional[str] = None
+    patient_name: Optional[str] = None
+    phone: Optional[str] = None
+    branch: Optional[str] = None
+    schedule_time: Optional[str] = None
+    service: Optional[str] = None
+    nurse_name: Optional[str] = None
+    status: Optional[str] = None
+
+class StatusUpdate(BaseModel):
+    status: str
+    en_route_time: Optional[str] = None
+    arrived_time: Optional[str] = None
+    completed_time: Optional[str] = None
+    prep_photo: Optional[str] = None
+    checklist_completed: Optional[bool] = None
+    is_manual_close: Optional[bool] = None
+    manual_close_reason: Optional[str] = None
+    
+    # 🔥 TAMBAHAN WAJIB BIAR KOORDINAT AWAL GA DIBUANG FASTAPI
+    current_lat: Optional[float] = None
+    current_lng: Optional[float] = None
+    start_lat: Optional[float] = None
+    start_lng: Optional[float] = None
+
+class ClaimJob(BaseModel):
+    nurse_name: str
+
+class TelemetryUpdate(BaseModel):
+    current_lat: float
+    current_lng: float
+
+class PatientReview(BaseModel):
+    patient_name: str
+    service_name: str
+    rating: int
+    answers: Dict[str, Any] = Field(default_factory=dict)
+    feedback: Optional[str] = ""
+
+# ==========================================
+# 1. RETRIEVE ALL TRANSACTIONS (WITH TELEMETRY & AUDIT)
 # ==========================================
 @router.get("", status_code=status.HTTP_200_OK)
 async def get_all_transactions():
     """
     Retrieve all operational schedules and perfectly map them for the React Frontend.
-    Includes Spatial Data (Lat/Lng) for both Patients and Field Agents.
+    Includes Spatial Data (Lat/Lng) and Pre-Departure Audit data.
     """
     try:
-        # Fetch raw data from Supabase 'patient_tasks' table
         response = supabase.table("patient_tasks").select("*").order("id", desc=True).execute()
-        
         raw_data = response.data or []
         print(f"🔍 [Diagnostic Radar] Supabase returned {len(raw_data)} raw rows from 'patient_tasks'.")
         
-        # SILICON VALLEY DATA MAPPING
         formatted_data = []
         for task in raw_data:
             formatted_data.append({
@@ -33,262 +94,197 @@ async def get_all_transactions():
                 "phone": task.get("phone") or "No Phone",
                 "service": task.get("service") or task.get("service_name") or "General Homecare",
                 
-                # Combine Date and Time for the table display safely
-                "schedule_time": f"{task.get('schedule_date', '')} {task.get('schedule_time', '')}".strip() or "TBA",
+                # 🔥 OMNI-CHANNEL SOURCE EXTRACTOR
+                "source": task.get("order_source") or task.get("source") or task.get("platform") or task.get("channel") or "INTERNAL", 
                 
+                "schedule_time": f"{task.get('schedule_date', '')} {task.get('schedule_time', '')}".strip() or "TBA",
                 "nurse_name": task.get("nurse_name") or "",
                 
-                # CRITICAL FIX: React table strictly expects 'orderStatus' (CamelCase)
                 "orderStatus": task.get("status") or "Scheduled",
                 "status": task.get("status") or "Scheduled",
-                "slaTotal": "00:00:00",
 
-                # 🔥 ENGINE WAKTU (DIKIRIM KE REACT BIAR TIMELINE GAK --:--)
                 "created_at": task.get("created_at"),
                 "en_route_time": task.get("en_route_time"),
                 "arrived_time": task.get("arrived_time"),
                 "completed_time": task.get("completed_time"),
                 
-                # Patient Destination Data
                 "patient_lat": task.get("patient_lat"),
                 "patient_lng": task.get("patient_lng"),
                 "address": task.get("address"),
                 "maps_link": task.get("maps_link"),
                 
-                # 🔥 FIELD AGENT LIVE TELEMETRY DATA
                 "current_lat": task.get("current_lat"),
-                "current_lng": task.get("current_lng")
+                "current_lng": task.get("current_lng"),
+
+                "prep_photo": task.get("prep_photo"),
+                "checklist_completed": task.get("checklist_completed") or False,
+                "is_manual_close": task.get("is_manual_close") or False,
+                "manual_close_reason": task.get("manual_close_reason")
             })
             
-        print(f"✅ [Transactions API] Successfully mapped and dispatched {len(formatted_data)} records to Frontend.")
         return formatted_data
         
     except Exception as e:
         print(f"🚨 [Transactions API CRITICAL] Failed to fetch data: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
-            detail="Failed to retrieve transaction records."
-        )
+        raise HTTPException(status_code=500, detail="Failed to retrieve transaction records.")
 
 
 # ==========================================
 # 2. CREATE NEW TRANSACTION
 # ==========================================
 @router.post("", status_code=status.HTTP_201_CREATED)
-async def create_transaction(payload: dict = Body(...)):
-    """
-    Create a new operational schedule.
-    Inserts data directly into the 'patient_tasks' table.
-    """
+async def create_transaction(payload: TransactionCreate):
     try:
-        # Clean the payload (remove None values) & ensure default status
-        insert_data = {k: v for k, v in payload.items() if v is not None}
+        insert_data = payload.model_dump(exclude_unset=True)
         insert_data["status"] = "Scheduled" 
         
+        # Menerjemahkan key dari Frontend menjadi nama kolom asli di Supabase
+        if "order_source" in insert_data:
+            insert_data["source"] = insert_data.pop("order_source")
+
         response = supabase.table("patient_tasks").insert(insert_data).execute()
         
         if not response.data:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST, 
-                detail="Database rejected the insertion. Please verify your payload structure."
-            )
+            raise HTTPException(status_code=400, detail="Database rejected the insertion.")
             
         print("✅ [Transactions API] New schedule successfully dispatched.")
-        return {
-            "status": "success", 
-            "message": "Schedule successfully created.", 
-            "data": response.data[0]
-        }
+        return {"status": "success", "message": "Schedule created.", "data": response.data[0]}
         
     except Exception as e:
-        print(f"🚨 [Transactions CRITICAL] Failed to create schedule: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
-            detail="Failed to dispatch new operational schedule to the database."
-        )
+        error_detail = str(e)
+        if hasattr(e, 'details'):
+            error_detail = f"{e.message} - {e.details}"
+        elif hasattr(e, 'message'):
+            error_detail = e.message
+            
+        print(f"🚨 [DB REJECTION CRITICAL] {error_detail}")
+        raise HTTPException(status_code=422, detail=f"Data Integrity Error: {error_detail}")
 
 
 # ==========================================
 # 3. UPDATE TRANSACTION DETAILS
 # ==========================================
 @router.patch("/{transaction_id}", status_code=status.HTTP_200_OK)
-async def update_transaction_detail(transaction_id: str, payload: dict = Body(...)):
-    """
-    Update specific operational fields of a transaction (Used by Edit Order Modal).
-    """
+async def update_transaction_detail(transaction_id: str, payload: TransactionUpdate):
     try:
-        update_data = {k: v for k, v in payload.items() if v is not None}
-        
+        update_data = payload.model_dump(exclude_unset=True)
         if not update_data:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST, 
-                detail="No valid data provided for update."
-            )
+            raise HTTPException(status_code=400, detail="No valid data provided for update.")
 
         response = supabase.table("patient_tasks").update(update_data).eq("id", transaction_id).execute()
         
         if not response.data:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND, 
-                detail=f"Transaction ID {transaction_id} not found."
-            )
+            raise HTTPException(status_code=404, detail=f"Transaction {transaction_id} not found.")
             
-        print(f"✅ [Transactions API] Successfully updated transaction {transaction_id}.")
-        return {
-            "status": "success", 
-            "message": "Transaction successfully updated.", 
-            "data": response.data[0]
-        }
+        return {"status": "success", "message": "Transaction updated.", "data": response.data[0]}
         
     except Exception as e:
-        print(f"🚨 [Transactions CRITICAL] Failed to update data: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
-            detail="Failed to update operational data in the database."
-        )
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ==========================================
-# 4. UPDATE TRANSACTION STATUS ONLY (DENGAN MESIN WAKTU)
+# 4. UPDATE TRANSACTION STATUS ONLY (WITH DB UPDATE)
 # ==========================================
 @router.patch("/{transaction_id}/status", status_code=status.HTTP_200_OK)
-async def update_transaction_status(transaction_id: str, status_payload: dict = Body(...)):
-    """
-    Update solely the operational status of a specific transaction.
-    """
+async def update_transaction_status(transaction_id: str, payload: StatusUpdate):
     try:
-        new_status = status_payload.get("status")
-        if not new_status:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST, 
-                detail="The 'status' field is required in the payload."
-            )
+        update_packet = payload.model_dump(exclude_unset=True)
 
-        # 🔥 INJEKSI WAKTU: Bikin paket update buat disuntik ke Supabase
-        update_packet = {"status": new_status}
-        
-        if "en_route_time" in status_payload:
-            update_packet["en_route_time"] = status_payload["en_route_time"]
-        if "arrived_time" in status_payload:
-            update_packet["arrived_time"] = status_payload["arrived_time"]
-        if "completed_time" in status_payload:
-            update_packet["completed_time"] = status_payload["completed_time"]
-
+        # 1. Update ke PostgreSQL Database (Ini otomatis akan nge-trigger event postgres_changes di Frontend lu)
         response = supabase.table("patient_tasks").update(update_packet).eq("id", transaction_id).execute()
         
         if not response.data:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND, 
-                detail=f"Transaction ID {transaction_id} not found."
-            )
+            raise HTTPException(status_code=404, detail=f"Transaction {transaction_id} not found.")
 
-        print(f"✅ [Transactions API] Successfully updated status of {transaction_id} to '{new_status}' with Time Data.")
-        return {
-            "status": "success", 
-            "message": f"Transaction status updated to {new_status}.", 
-            "data": response.data[0]
-        }
+        # 2. Opsional: Lempar sinyal realtime ekstra (Kalau sewaktu-waktu lu butuh custom event)
+        try:
+            supabase.channel('hq-dashboard-metrics').send(
+                "broadcast",
+                {
+                    "event": "status_update",
+                    "payload": {
+                        "transaction_id": transaction_id,
+                        "status": payload.status
+                    }
+                }
+            )
+        except Exception as e:
+            print(f"⚠️ [Broadcast Warning] Could not broadcast status: {e}")
+
+        return {"status": "success", "message": f"Status updated to {payload.status}.", "data": response.data[0]}
         
     except Exception as e:
-        print(f"🚨 [Transactions CRITICAL] Failed to update status: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
-            detail="Failed to update operational status in the database."
-        )
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ==========================================
 # 5. ATOMIC LOCKING (CLAIM JOB)
 # ==========================================
 @router.patch("/{transaction_id}/claim", status_code=status.HTTP_200_OK)
-async def claim_transaction(transaction_id: str, payload: dict = Body(...)):
-    """
-    Atomic Locking Engine for Open Job Board.
-    Ensures that an order cannot be claimed by two agents simultaneously.
-    """
+async def claim_transaction(transaction_id: str, payload: ClaimJob):
     try:
-        nurse_name = payload.get("nurse_name")
-        if not nurse_name:
-            raise HTTPException(status_code=400, detail="Practitioner identity is required.")
-
-        # Verification: Check if the order is already taken
-        check_query = supabase.table("patient_tasks").select("nurse_name, status").eq("id", transaction_id).execute()
+        check_query = supabase.table("patient_tasks").select("nurse_name").eq("id", transaction_id).execute()
         
         if not check_query.data:
-            raise HTTPException(status_code=404, detail="Task not found in the system.")
+            raise HTTPException(status_code=404, detail="Task not found.")
             
         current_nurse = check_query.data[0].get("nurse_name")
         
         if current_nurse and current_nurse.strip() != "":
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT, 
-                detail="Too late! This order has already been claimed by another practitioner."
-            )
+            raise HTTPException(status_code=409, detail="This order has already been claimed.")
 
-        # Atomic Lock: Claim the task and update status
-        response = supabase.table("patient_tasks").update({
-            "nurse_name": nurse_name,
+        supabase.table("patient_tasks").update({
+            "nurse_name": payload.nurse_name,
             "status": "Assigned" 
         }).eq("id", transaction_id).execute()
 
-        print(f"🔒 [JOB BOARD] Order {transaction_id} successfully claimed by {nurse_name}.")
         return {"status": "success", "message": "Order successfully locked and claimed."}
         
     except HTTPException:
         raise
     except Exception as e:
-        print(f"🚨 [JOB BOARD CRITICAL] Failed to claim order: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 # ==========================================
-# 6. 🛰️ LIVE GPS TELEMETRY TRACKER 
+# 6. 🛰️ LIVE GPS TELEMETRY TRACKER (BROADCAST ONLY - NO DB WRITE!)
 # ==========================================
 @router.patch("/{transaction_id}/tracking", status_code=status.HTTP_200_OK)
-async def update_live_tracking(transaction_id: str, payload: dict = Body(...)):
+async def update_live_tracking(transaction_id: str, payload: TelemetryUpdate):
     """
-    Live GPS Tracking Endpoint for Field Agents.
-    Receives current_lat and current_lng from the Agent's mobile device.
+    🔥 SILICON VALLEY ARCHITECTURE 🔥
+    Endpoint ini TIDAK menyentuh database sama sekali. 
+    Ia hanya berfungsi sebagai stasiun relay untuk melempar koordinat ke memori browser Command Center.
+    Hemat kuota, hemat CPU server, 0 delay!
     """
     try:
-        lat = payload.get("current_lat")
-        lng = payload.get("current_lng")
-        
-        if lat is None or lng is None:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST, 
-                detail="Missing GPS coordinates in telemetry payload."
-            )
+        # Mengirim data langsung ke channel "live-radar" untuk ditangkap oleh OverviewTab.jsx di Frontend
+        supabase.channel('live-radar').send(
+            "broadcast",
+            {
+                "event": "location_update",
+                "payload": {
+                    "transaction_id": transaction_id,
+                    "lat": payload.current_lat,
+                    "lng": payload.current_lng
+                }
+            }
+        )
 
-        # Update the transaction table with the agent's live location
-        response = supabase.table("patient_tasks").update({
-            "current_lat": lat,
-            "current_lng": lng
-        }).eq("id", transaction_id).execute()
-        
-        if not response.data:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND, 
-                detail="Active task not found for GPS injection."
-            )
-
-        print(f"📡 [RADAR] Agent Telemetry Received -> TRX: {transaction_id} | Lat: {lat}, Lng: {lng}")
-        return {"status": "success", "message": "GPS telemetry ping registered successfully."}
+        # Mengembalikan response seolah-olah sukses disimpan biar aplikasi perawat tidak error
+        return {"status": "success", "message": "GPS telemetry broadcasted to command center."}
         
     except Exception as e:
-        print(f"🚨 [RADAR CRITICAL] Telemetry processing failed: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"🚨 [Telemetry Broadcast Error] {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to broadcast telemetry")
+
 
 # ==========================================
 # 7. 📋 GET DYNAMIC SURVEY TEMPLATE FOR PATIENT
 # ==========================================
 @router.get("/{transaction_id}/survey", status_code=status.HTTP_200_OK)
 async def get_patient_survey(transaction_id: str):
-    """
-    Fetch the correct survey template based on the service the patient received.
-    """
     try:
-        # 1. Cari tau pasien ini dapet layanan apa
         task_query = supabase.table("patient_tasks").select("service, patient_name").eq("id", transaction_id).execute()
         if not task_query.data:
             raise HTTPException(status_code=404, detail="Transaction not found.")
@@ -296,13 +292,10 @@ async def get_patient_survey(transaction_id: str):
         service_name = task_query.data[0].get("service", "").lower()
         patient_name = task_query.data[0].get("patient_name", "")
 
-        # 2. Tentukan Template Key berdasarkan layanan (Mapping cerdas)
-        config_key = 'SURVEY_TEMPLATE_VAKSIN' # Default
+        config_key = 'SURVEY_TEMPLATE_VAKSIN' 
         if 'wound' in service_name or 'luka' in service_name:
             config_key = 'SURVEY_TEMPLATE_WOUND_CARE'
-        # Nanti lu bisa tambahin IF lagi buat layanan lain (Infus, Fisio, dll)
 
-        # 3. Tarik template pertanyaan dari system_configs
         config_query = supabase.table("system_configs").select("config_value").eq("config_key", config_key).execute()
         questions = config_query.data[0].get("config_value", []) if config_query.data else []
 
@@ -315,38 +308,27 @@ async def get_patient_survey(transaction_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 # ==========================================
 # 8. ⭐ SUBMIT PATIENT REVIEW & AUTO-COMPLETE MISSION
 # ==========================================
 @router.post("/{transaction_id}/review", status_code=status.HTTP_200_OK)
-async def submit_patient_review(transaction_id: str, payload: dict = Body(...)):
-    """
-    Saves patient review and AUTOMATICALLY triggers 'Completed' status.
-    """
+async def submit_patient_review(transaction_id: str, payload: PatientReview):
     try:
-        # 1. Simpan review ke tabel patient_reviews
-        review_data = {
-            "transaction_id": transaction_id,
-            "patient_name": payload.get("patient_name"),
-            "service_name": payload.get("service_name"),
-            "rating": payload.get("rating"),
-            "dynamic_answers": payload.get("answers", {}), # Jawaban JSON dari pasien
-            "feedback": payload.get("feedback", "")
-        }
+        review_data = payload.model_dump()
+        review_data["transaction_id"] = transaction_id
+        
         supabase.table("patient_reviews").insert(review_data).execute()
 
-        # 2. 🔥 THE MAGIC: Otomatis ubah status task jadi COMPLETED & catat jam selesai!
-        from datetime import datetime, timezone
         now_utc = datetime.now(timezone.utc).isoformat()
         
+        # Trigger event postgres_changes ke Frontend
         supabase.table("patient_tasks").update({
             "status": "Completed",
             "completed_time": now_utc
         }).eq("id", transaction_id).execute()
 
-        print(f"⭐ [REVIEW] Transaction {transaction_id} is now COMPLETED by Patient!")
         return {"status": "success", "message": "Review submitted and mission completed."}
 
     except Exception as e:
-        print(f"🚨 [REVIEW CRITICAL] Failed to submit review: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))

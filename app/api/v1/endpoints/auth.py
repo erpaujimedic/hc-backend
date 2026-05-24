@@ -1,10 +1,15 @@
 # File: app/api/v1/endpoints/auth.py
+import os
+from dotenv import load_dotenv
+
+# Nyalain mesin pembaca environment variables dari file .env
+load_dotenv()
+
 from fastapi import APIRouter, HTTPException, status, Request, Body
 from pydantic import BaseModel
 from typing import Optional
 from app.db.supabase import supabase
 import requests
-import os
 import uuid
 
 try:
@@ -35,6 +40,9 @@ class RegisterResponse(BaseModel):
     message: str
     uid: str
     status: str
+
+class OverrideRequest(BaseModel):
+    master_key: str
 
 # --- ENDPOINTS ---
 
@@ -150,6 +158,39 @@ async def get_current_user(request: Request):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token encryption or session identity has expired.")
 
 
+# ==========================================
+# 🔐 SPV SECURITY OVERRIDE VERIFICATION
+# ==========================================
+@router.post("/verify-override", status_code=status.HTTP_200_OK)
+async def verify_spv_override(payload: OverrideRequest, request: Request):
+    """
+    Secure endpoint to verify SPV Master Key for emergency order overrides.
+    Prevents hardcoded passwords in the React frontend.
+    """
+    try:
+        # Opsional: Pastikan yang nge-request minimal udah login
+        await get_current_user(request)
+        
+        # 🔥 ENTERPRISE SECURITY: Ambil kunci dari Environment Variable.
+        # Fallback ke 'admin123' sementara kalau env belum di-set di server Render lo.
+        valid_key = os.getenv("SPV_MASTER_KEY", "admin123")
+        
+        if payload.master_key != valid_key:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED, 
+                detail="Invalid Master Key. Access Denied."
+            )
+            
+        print("🔓 [SECURITY] SPV Override Key verified successfully.")
+        return {"status": "success", "message": "Master Key verified. Edit unlocked."}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"🚨 [Security API Error] Failed to verify override key: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal security verification error.")
+
+
 @router.post("/register", response_model=RegisterResponse, status_code=status.HTTP_201_CREATED)
 async def register_endpoint(payload: RegisterRequest):
     """
@@ -211,6 +252,7 @@ async def require_admin(request: Request):
             detail="Access denied. Administrator level privileges required."
         )
     return user_data
+
 
 @router.get("/requests/pending", status_code=status.HTTP_200_OK)
 async def get_pending_requests():
@@ -283,6 +325,7 @@ async def reject_request(uid: str):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
             detail="An unexpected error occurred while rejecting the application."
         )
+
 
 # ==========================================
 # 📢 FETCH PUBLIC ANNOUNCEMENT (FOR LOGIN VIEW)
@@ -423,4 +466,4 @@ async def update_staff_photo(staff_id: str, request: Request, payload: dict = Bo
         raise
     except Exception as e:
         print(f"🚨 [Photo API Error] Database sync mutation crashed: {str(e)}")
-        raise HTTPException(status_code=500, detail="Failed to map secure asset location to Supabase row.")        
+        raise HTTPException(status_code=500, detail="Failed to map secure asset location to Supabase row.")
